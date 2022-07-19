@@ -14,7 +14,9 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
+	goerrors "errors"
 	"fmt"
+	"github.com/ProtonMail/go-crypto/openpgp/kyber"
 	"io"
 	"io/ioutil"
 	"math/big"
@@ -135,7 +137,7 @@ func NewSignerPrivateKey(creationTime time.Time, signer crypto.Signer) *PrivateK
 	return pk
 }
 
-// NewDecrypterPrivateKey creates a PrivateKey from a *{rsa|elgamal|ecdh}.PrivateKey.
+// NewDecrypterPrivateKey creates a PrivateKey from a *{rsa|elgamal|ecdh|kyber}.PrivateKey.
 func NewDecrypterPrivateKey(creationTime time.Time, decrypter interface{}) *PrivateKey {
 	pk := new(PrivateKey)
 	switch priv := decrypter.(type) {
@@ -145,6 +147,8 @@ func NewDecrypterPrivateKey(creationTime time.Time, decrypter interface{}) *Priv
 		pk.PublicKey = *NewElGamalPublicKey(creationTime, &priv.PublicKey)
 	case *ecdh.PrivateKey:
 		pk.PublicKey = *NewECDHPublicKey(creationTime, &priv.PublicKey)
+	case *kyber.PrivateKey:
+		pk.PublicKey = *NewKyberPublicKey(creationTime, &priv.PublicKey)
 	default:
 		panic("openpgp: unknown decrypter type in NewDecrypterPrivateKey")
 	}
@@ -368,6 +372,14 @@ func serializeECDHPrivateKey(w io.Writer, priv *ecdh.PrivateKey) error {
 	return err
 }
 
+func serializeKyberPrivateKey(w io.Writer, priv *kyber.PrivateKey) error {
+	if _, err := w.Write(encoding.NewOctetArray(priv.SecretEC).EncodedBytes()); err != nil {
+		return err
+	}
+	_, err := w.Write(encoding.NewOctetArray(priv.SecretKyber).EncodedBytes())
+	return err
+}
+
 // Decrypt decrypts an encrypted private key using a passphrase.
 func (pk *PrivateKey) Decrypt(passphrase []byte) error {
 	if pk.Dummy() {
@@ -501,6 +513,8 @@ func (pk *PrivateKey) serializePrivateKey(w io.Writer) (err error) {
 		err = serializeEdDSAPrivateKey(w, priv)
 	case *ecdh.PrivateKey:
 		err = serializeECDHPrivateKey(w, priv)
+	case *kyber.PrivateKey:
+		err = serializeKyberPrivateKey(w, priv)
 	default:
 		err = errors.InvalidArgumentError("unknown private key type")
 	}
@@ -521,6 +535,14 @@ func (pk *PrivateKey) parsePrivateKey(data []byte) (err error) {
 		return pk.parseECDHPrivateKey(data)
 	case PubKeyAlgoEdDSA:
 		return pk.parseEdDSAPrivateKey(data)
+	case PubKeyAlgoKyber512X25519:
+		return pk.parseKyberPrivateKey(data, 32, 1632)
+	case PubKeyAlgoKyber1024X448:
+		return pk.parseKyberPrivateKey(data, 56, 3168)
+	case PubKeyAlgoKyber768P384:
+		return pk.parseKyberPrivateKey(data, 48, 2400)
+	case PubKeyAlgoKyber1024P521:
+		return pk.parseKyberPrivateKey(data, 66, 3168)
 	}
 	panic("impossible")
 }
@@ -656,6 +678,35 @@ func (pk *PrivateKey) parseEdDSAPrivateKey(data []byte) (err error) {
 		return err
 	}
 	pk.PrivateKey = &eddsaPriv
+
+	return nil
+}
+
+func (pk *PrivateKey) parseKyberPrivateKey(data []byte, ecLen, kLen int) (err error) {
+	if pk.Version != 5 {
+		return goerrors.New("openpgp: cannot parse non-v5 kyber key")
+	}
+	pub := pk.PublicKey.PublicKey.(*kyber.PublicKey)
+	priv := new(kyber.PrivateKey)
+	priv.PublicKey = *pub
+
+	buf := bytes.NewBuffer(data)
+	ec := encoding.NewEmptyOctetArray(ecLen)
+	if _, err := ec.ReadFrom(buf); err != nil {
+		return err
+	}
+
+	k := encoding.NewEmptyOctetArray(kLen)
+	if _, err := k.ReadFrom(buf); err != nil {
+		return err
+	}
+
+	priv.SecretEC = ec.Bytes()
+	priv.SecretKyber = k.Bytes()
+	if err := kyber.ValidateKyberKey(priv); err != nil {
+		return err
+	}
+	pk.PrivateKey = priv
 
 	return nil
 }

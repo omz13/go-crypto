@@ -14,7 +14,11 @@ import (
 	"crypto/sha256"
 	_ "crypto/sha512"
 	"encoding/binary"
+	goerrors "errors"
 	"fmt"
+	"github.com/ProtonMail/go-crypto/openpgp/kyber"
+	"github.com/ProtonMail/go-crypto/openpgp/kyber/curves"
+	libkyber "github.com/kudelskisecurity/crystals-go/crystals-kyber"
 	"hash"
 	"io"
 	"math/big"
@@ -38,7 +42,7 @@ type PublicKey struct {
 	Version      int
 	CreationTime time.Time
 	PubKeyAlgo   PublicKeyAlgorithm
-	PublicKey    interface{} // *rsa.PublicKey, *dsa.PublicKey, *ecdsa.PublicKey or *eddsa.PublicKey
+	PublicKey    interface{} // *rsa.PublicKey, *dsa.PublicKey, *ecdsa.PublicKey, *eddsa.PublicKey or *kyber.PublicKey
 	Fingerprint  []byte
 	KeyId        uint64
 	IsSubkey     bool
@@ -169,6 +173,22 @@ func NewECDHPublicKey(creationTime time.Time, pub *ecdh.PublicKey) *PublicKey {
 	return pk
 }
 
+func NewKyberPublicKey(creationTime time.Time, pub *kyber.PublicKey) *PublicKey {
+	var pk *PublicKey
+
+	pk = &PublicKey{
+		Version:      5,
+		CreationTime: creationTime,
+		PubKeyAlgo:   PublicKeyAlgorithm(pub.AlgId),
+		PublicKey:    pub,
+		p:            encoding.NewOctetArray(pub.PublicPoint),
+		q:            encoding.NewOctetArray(pub.PublicKyber),
+	}
+
+	pk.setFingerprintAndKeyId()
+	return pk
+}
+
 func NewEdDSAPublicKey(creationTime time.Time, pub *ed25519.PublicKey) *PublicKey {
 	curveInfo := ecc.FindByName("Ed25519")
 	pk := &PublicKey{
@@ -219,6 +239,14 @@ func (pk *PublicKey) parse(r io.Reader) (err error) {
 		err = pk.parseECDH(r)
 	case PubKeyAlgoEdDSA:
 		err = pk.parseEdDSA(r)
+	case PubKeyAlgoKyber512X25519:
+		err = pk.parseKyber(r, 32, 800)
+	case PubKeyAlgoKyber1024X448:
+		err = pk.parseKyber(r, 56, 1568)
+	case PubKeyAlgoKyber768P384:
+		err = pk.parseKyber(r, 97, 1184)
+	case PubKeyAlgoKyber1024P521:
+		err = pk.parseKyber(r, 133, 1568)
 	default:
 		err = errors.UnsupportedError("public key type: " + strconv.Itoa(int(pk.PubKeyAlgo)))
 	}
@@ -417,6 +445,36 @@ func (pk *PublicKey) parseECDH(r io.Reader) (err error) {
 	return
 }
 
+func (pk *PublicKey) parseKyber(r io.Reader, ecLen, kLen int) (err error) {
+	pk.p = encoding.NewEmptyOctetArray(ecLen)
+	if _, err = pk.p.ReadFrom(r); err != nil {
+		return
+	}
+
+	pk.q = encoding.NewEmptyOctetArray(kLen)
+	if _, err = pk.q.ReadFrom(r); err != nil {
+		return
+	}
+
+	pub := &kyber.PublicKey{
+		AlgId: uint8(pk.PubKeyAlgo),
+		PublicPoint: pk.p.Bytes(),
+		PublicKyber: pk.q.Bytes(),
+	}
+
+	if pub.Curve, err = GetCurveFromAlgID(pk.PubKeyAlgo); err != nil {
+		return err
+	}
+
+	if pub.Kyber, err = GetKyberFromAlgID(pk.PubKeyAlgo); err != nil {
+		return err
+	}
+
+	pk.PublicKey = pub
+
+	return
+}
+
 func (pk *PublicKey) parseEdDSA(r io.Reader) (err error) {
 	pk.oid = new(encoding.OID)
 	if _, err = pk.oid.ReadFrom(r); err != nil {
@@ -515,6 +573,9 @@ func (pk *PublicKey) algorithmSpecificByteCount() int {
 	case PubKeyAlgoEdDSA:
 		length += int(pk.oid.EncodedLength())
 		length += int(pk.p.EncodedLength())
+	case PubKeyAlgoKyber512X25519, PubKeyAlgoKyber1024X448, PubKeyAlgoKyber768P384, PubKeyAlgoKyber1024P521:
+		length += int(pk.p.EncodedLength())
+		length += int(pk.q.EncodedLength())
 	default:
 		panic("unknown public key algorithm")
 	}
@@ -591,13 +652,19 @@ func (pk *PublicKey) serializeWithoutHeaders(w io.Writer) (err error) {
 		}
 		_, err = w.Write(pk.p.EncodedBytes())
 		return
+	case PubKeyAlgoKyber512X25519, PubKeyAlgoKyber1024X448, PubKeyAlgoKyber768P384, PubKeyAlgoKyber1024P521:
+		if _, err = w.Write(pk.p.EncodedBytes()); err != nil {
+			return
+		}
+		_, err = w.Write(pk.q.EncodedBytes())
+		return
 	}
 	return errors.InvalidArgumentError("bad public-key algorithm")
 }
 
 // CanSign returns true iff this public key can generate signatures
 func (pk *PublicKey) CanSign() bool {
-	return pk.PubKeyAlgo != PubKeyAlgoRSAEncryptOnly && pk.PubKeyAlgo != PubKeyAlgoElGamal && pk.PubKeyAlgo != PubKeyAlgoECDH
+	return pk.PubKeyAlgo.CanSign()
 }
 
 // VerifySignature returns nil iff sig is a valid signature, made by this
@@ -805,6 +872,8 @@ func (pk *PublicKey) BitLength() (bitLength uint16, err error) {
 		bitLength = pk.p.BitLength()
 	case PubKeyAlgoEdDSA:
 		bitLength = pk.p.BitLength()
+	case PubKeyAlgoKyber512X25519, PubKeyAlgoKyber1024X448, PubKeyAlgoKyber768P384, PubKeyAlgoKyber1024P521:
+		bitLength = pk.q.BitLength() // Very questionable
 	default:
 		err = errors.InvalidArgumentError("bad public-key algorithm")
 	}
@@ -822,4 +891,33 @@ func (pk *PublicKey) KeyExpired(sig *Signature, currentTime time.Time) bool {
 	}
 	expiry := pk.CreationTime.Add(time.Duration(*sig.KeyLifetimeSecs) * time.Second)
 	return currentTime.After(expiry)
+}
+
+
+func GetKyberFromAlgID(algId PublicKeyAlgorithm) (*libkyber.Kyber, error) {
+	switch algId {
+	case PubKeyAlgoKyber512X25519:
+		return libkyber.NewKyber512(), nil
+	case PubKeyAlgoKyber768P384:
+		return libkyber.NewKyber768(), nil
+	case PubKeyAlgoKyber1024X448, PubKeyAlgoKyber1024P521:
+		return libkyber.NewKyber1024(), nil
+	default:
+		return nil, goerrors.New("packet: unsupported kyber public key algorithm")
+	}
+}
+
+func GetCurveFromAlgID(algId PublicKeyAlgorithm) (curves.Curve, error) {
+	switch algId {
+	case PubKeyAlgoKyber512X25519:
+		return curves.NewX25519(), nil
+	case PubKeyAlgoKyber768P384:
+		return curves.NewNistCurve(elliptic.P384()), nil
+	case PubKeyAlgoKyber1024P521:
+		return curves.NewNistCurve(elliptic.P521()), nil
+	case PubKeyAlgoKyber1024X448:
+		return curves.NewX448(), nil
+	default:
+		return nil, goerrors.New("packet: unsupported ECDH public key algorithm")
+	}
 }

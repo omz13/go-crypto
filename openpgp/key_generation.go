@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	goerrors "errors"
+	"github.com/ProtonMail/go-crypto/openpgp/kyber"
 	"io"
 	"math/big"
 
@@ -289,6 +290,21 @@ func newDecrypter(config *packet.Config) (decrypter interface{}, err error) {
 			Cipher: algorithm.AES256,
 		}
 		return ecdh.X25519GenerateKey(config.Random(), kdf)
+	case packet.PubKeyAlgoKyber512X25519, packet.PubKeyAlgoKyber1024X448, packet.PubKeyAlgoKyber768P384, packet.PubKeyAlgoKyber1024P521:
+		if !config.V5Keys {
+			return nil, goerrors.New("openpgp: cannot create a non-v5 kyber key")
+		}
+
+		c, err := packet.GetCurveFromAlgID(config.PublicKeyAlgorithm())
+		if err != nil {
+			return nil, err
+		}
+		k, err := packet.GetKyberFromAlgID(config.PublicKeyAlgorithm())
+		if err != nil {
+			return nil, err
+		}
+
+		return kyber.GenerateKey(config.Random(), uint8(config.PublicKeyAlgorithm()), c, k)
 	default:
 		return nil, errors.InvalidArgumentError("unsupported public key algorithm")
 	}

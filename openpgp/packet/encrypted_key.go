@@ -8,6 +8,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"encoding/binary"
+	"github.com/ProtonMail/go-crypto/openpgp/kyber"
 	"io"
 	"math/big"
 	"strconv"
@@ -28,7 +29,10 @@ type EncryptedKey struct {
 	CipherFunc CipherFunction // only valid after a successful Decrypt
 	Key        []byte         // only valid after a successful Decrypt
 
-	encryptedMPI1, encryptedMPI2 encoding.Field
+	// TODO: refactor names
+	encryptedMPI1 encoding.Field // Only valid in RSA, Elgamal, ECDH, and PQC keys
+	encryptedMPI2 encoding.Field // Only valid in Elgamal, ECDH and PQC keys
+	encryptedMPI3 encoding.Field // Only valid in PQC keys
 }
 
 func (e *EncryptedKey) parse(r io.Reader) (err error) {
@@ -68,8 +72,43 @@ func (e *EncryptedKey) parse(r io.Reader) (err error) {
 		if _, err = e.encryptedMPI2.ReadFrom(r); err != nil {
 			return
 		}
+	case PubKeyAlgoKyber512X25519:
+		if err = e.readKyberKey(r, 32, 768); err != nil {
+			return err
+		}
+	case PubKeyAlgoKyber1024X448:
+		if err = e.readKyberKey(r, 56, 1568); err != nil {
+			return err
+		}
+	case PubKeyAlgoKyber768P384:
+		if err = e.readKyberKey(r, 97, 1088); err != nil {
+			return err
+		}
+	case PubKeyAlgoKyber1024P521:
+		if err = e.readKyberKey(r, 133, 1568); err != nil {
+			return err
+		}
 	}
 	_, err = consumeAll(r)
+	return
+}
+
+func (e *EncryptedKey) readKyberKey(r io.Reader, lenEcc, lenKyber int) (err error){
+	e.encryptedMPI1 = encoding.NewEmptyOctetArray(lenEcc)
+	if _, err = e.encryptedMPI1.ReadFrom(r); err != nil {
+		return
+	}
+
+	e.encryptedMPI2 = encoding.NewEmptyOctetArray(lenKyber)
+	if _, err = e.encryptedMPI2.ReadFrom(r); err != nil {
+		return
+	}
+
+	e.encryptedMPI3 = new(encoding.OID)
+	if _, err = e.encryptedMPI3.ReadFrom(r); err != nil {
+		return
+	}
+
 	return
 }
 
@@ -114,6 +153,11 @@ func (e *EncryptedKey) Decrypt(priv *PrivateKey, config *Config) error {
 		m := e.encryptedMPI2.Bytes()
 		oid := priv.PublicKey.oid.EncodedBytes()
 		b, err = ecdh.Decrypt(priv.PrivateKey.(*ecdh.PrivateKey), vsG, m, oid, priv.PublicKey.Fingerprint[:])
+	case PubKeyAlgoKyber512X25519, PubKeyAlgoKyber1024X448, PubKeyAlgoKyber768P384, PubKeyAlgoKyber1024P521:
+		ecE := e.encryptedMPI1.Bytes()
+		kE := e.encryptedMPI2.Bytes()
+		m := e.encryptedMPI3.Bytes()
+		b, err = kyber.Decrypt(priv.PrivateKey.(*kyber.PrivateKey), kE, ecE, m, priv.PublicKey.Fingerprint[:])
 	default:
 		err = errors.InvalidArgumentError("cannot decrypt encrypted session key with private key of type " + strconv.Itoa(int(priv.PubKeyAlgo)))
 	}
@@ -143,6 +187,8 @@ func (e *EncryptedKey) Serialize(w io.Writer) error {
 		mpiLen = int(e.encryptedMPI1.EncodedLength()) + int(e.encryptedMPI2.EncodedLength())
 	case PubKeyAlgoECDH:
 		mpiLen = int(e.encryptedMPI1.EncodedLength()) + int(e.encryptedMPI2.EncodedLength())
+	case PubKeyAlgoKyber512X25519, PubKeyAlgoKyber1024X448, PubKeyAlgoKyber768P384, PubKeyAlgoKyber1024P521:
+		mpiLen = int(e.encryptedMPI1.EncodedLength()) + int(e.encryptedMPI2.EncodedLength()) + int(e.encryptedMPI3.EncodedLength())
 	default:
 		return errors.InvalidArgumentError("don't know how to serialize encrypted key type " + strconv.Itoa(int(e.Algo)))
 	}
@@ -172,6 +218,15 @@ func (e *EncryptedKey) Serialize(w io.Writer) error {
 		}
 		_, err := w.Write(e.encryptedMPI2.EncodedBytes())
 		return err
+	case PubKeyAlgoKyber512X25519, PubKeyAlgoKyber1024X448, PubKeyAlgoKyber768P384, PubKeyAlgoKyber1024P521:
+		if _, err := w.Write(e.encryptedMPI1.EncodedBytes()); err != nil {
+			return err
+		}
+		if _, err := w.Write(e.encryptedMPI2.EncodedBytes()); err != nil {
+			return err
+		}
+		_, err := w.Write(e.encryptedMPI3.EncodedBytes())
+		return err
 	default:
 		panic("internal error")
 	}
@@ -200,6 +255,8 @@ func SerializeEncryptedKey(w io.Writer, pub *PublicKey, cipherFunc CipherFunctio
 		return serializeEncryptedKeyElGamal(w, config.Random(), buf, pub.PublicKey.(*elgamal.PublicKey), keyBlock)
 	case PubKeyAlgoECDH:
 		return serializeEncryptedKeyECDH(w, config.Random(), buf, pub.PublicKey.(*ecdh.PublicKey), keyBlock, pub.oid, pub.Fingerprint)
+	case PubKeyAlgoKyber512X25519, PubKeyAlgoKyber1024X448, PubKeyAlgoKyber768P384, PubKeyAlgoKyber1024P521:
+		return serializeEncryptedKeyKyber(w, config.Random(), buf, pub.PublicKey.(*kyber.PublicKey), keyBlock, pub.Fingerprint)
 	case PubKeyAlgoDSA, PubKeyAlgoRSASignOnly:
 		return errors.InvalidArgumentError("cannot encrypt to public key of type " + strconv.Itoa(int(pub.PubKeyAlgo)))
 	}
@@ -275,6 +332,38 @@ func serializeEncryptedKeyECDH(w io.Writer, rand io.Reader, header [10]byte, pub
 		return err
 	}
 	if _, err = w.Write(g.EncodedBytes()); err != nil {
+		return err
+	}
+	_, err = w.Write(m.EncodedBytes())
+	return err
+}
+
+func serializeEncryptedKeyKyber(w io.Writer, rand io.Reader, header [10]byte, pub *kyber.PublicKey, keyBlock []byte, fingerprint []byte) error {
+	kE, ecE, c, err := kyber.Encrypt(rand, pub, keyBlock, fingerprint)
+	if err != nil {
+		return errors.InvalidArgumentError("ECDH encryption failed: " + err.Error())
+	}
+
+	k := encoding.NewOctetArray(kE)
+	ec := encoding.NewOctetArray(ecE)
+	m := encoding.NewOID(c)
+
+	packetLen := 10 /* header length */
+	packetLen += int(ec.EncodedLength()) + int(k.EncodedLength()) + int(m.EncodedLength())
+
+	err = serializeHeader(w, packetTypeEncryptedKey, packetLen)
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(header[:])
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(ec.EncodedBytes()); err != nil {
+		return err
+	}
+	if _, err = w.Write(k.EncodedBytes()); err != nil {
 		return err
 	}
 	_, err = w.Write(m.EncodedBytes())
